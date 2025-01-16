@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+
+# vbox-module-signer.sh
+# This script automates the process of signing VirtualBox kernel modules for Secure Boot
+# It includes comprehensive documentation of all manual commands for reference and learning
+
+################################################################################
+# MANUAL COMMAND REFERENCE
+# Here are all the commands you might need if doing this process manually:
+#
+# 1. Prerequisites Installation:
+#    sudo apt-get update
+#    sudo apt-get install linux-headers-$(uname -r) dkms build-essential
+#
+# 2. Check Secure Boot Status:
+#    mokutil --sb-state
+#
+# 3. Check Current VirtualBox Modules:
+#    lsmod | grep vbox
+#    modinfo vboxdrv
+#
+# 4. Manual Key Generation Process:
+#    mkdir -p ~/module-signing
+#    cd ~/module-signing
+#    openssl req -new -x509 -newkey rsa:2048 -keyout MOK.priv -outform DER -out MOK.der -nodes -days 36500 -subj "/CN=YOUR_NAME/"
+#    chmod 600 MOK.priv
+#
+# 5. Manual Key Enrollment:
+#    sudo mokutil --import MOK.der
+#
+# 6. Manual Module Signing Process:
+#    sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
+#        ~/module-signing/MOK.priv \
+#        ~/module-signing/MOK.der \
+#        $(modinfo -n vboxdrv)
+#    sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
+#        ~/module-signing/MOK.priv \
+#        ~/module-signing/MOK.der \
+#        $(modinfo -n vboxnetflt)
+#    sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
+#        ~/module-signing/MOK.priv \
+#        ~/module-signing/MOK.der \
+#        $(modinfo -n vboxnetadp)
+#    sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
+#        ~/module-signing/MOK.priv \
+#        ~/module-signing/MOK.der \
+#        $(modinfo -n vboxpci)
+#
+# 7. Manual Module Loading:
+#    sudo modprobe vboxdrv
+#    sudo modprobe vboxnetflt
+#    sudo modprobe vboxnetadp
+#    sudo modprobe vboxpci
+#
+# 8. VirtualBox Service Management:
+#    sudo systemctl status vboxdrv
+#    sudo systemctl restart vboxdrv
+#
+# 9. Rebuilding VirtualBox Modules:
+#    sudo /sbin/vboxconfig
+#
+# 10. Verify Module Status:
+#     lsmod | grep vbox
+#     dmesg | grep -i vbox
+#
+################################################################################
+
+# Set strict error handling
+set -euo pipefail
+
+# Color codes for output formatting
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Directory where we'll store the signing keys
+SIGNING_DIR="$HOME/module-signing"
+PRIVATE_KEY="$SIGNING_DIR/MOK.priv"
+PUBLIC_KEY="$SIGNING_DIR/MOK.der"
+
+# Log messages with color
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if script is run as root
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+# Install prerequisites
+install_prerequisites() {
+    log_info "Installing prerequisites..."
+    apt-get update
+    apt-get install -y linux-headers-$(uname -r) dkms build-essential
+}
+
+# Check if required tools are installed
+check_dependencies() {
+    local missing_deps=()
+    
+    for cmd in openssl mokutil dkms modinfo; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        log_info "Please install them using your package manager"
+        exit 1
+    fi
+}
+
+# Check Secure Boot status
+check_secure_boot() {
+    log_info "Checking Secure Boot status..."
+    mokutil --sb-state
+}
+
+# Generate signing keys if they don't exist
+generate_keys() {
+    if [ -f "$PRIVATE_KEY" ] && [ -f "$PUBLIC_KEY" ]; then
+        log_warn "Signing keys already exist in $SIGNING_DIR"
+        read -p "Generate new keys? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            return
+        fi
+    fi
+
+    log_info "Generating new signing keys..."
+    mkdir -p "$SIGNING_DIR"
+    openssl req -new -x509 -newkey rsa:2048 -keyout "$PRIVATE_KEY" \
+        -outform DER -out "$PUBLIC_KEY" -nodes -days 36500 \
+        -subj "/CN=VirtualBox Modules Signer/"
+    
+    chmod 600 "$PRIVATE_KEY"
+    log_info "Keys generated successfully"
+}
+
+# Enroll the public key in MOK
+enroll_key() {
+    log_info "Enrolling public key in MOK..."
+    mokutil --import "$PUBLIC_KEY"
+    log_info "Key enrolled. You will need to complete the enrollment at next boot"
+    log_info "Please remember the password you just set!"
+}
+
+# Sign VirtualBox modules
+sign_modules() {
+    local modules=("vboxdrv" "vboxnetflt" "vboxnetadp" "vboxpci")
+    local modules_dir
+    
+    # Find the directory containing VirtualBox modules
+    modules_dir=$(dirname "$(modinfo -n vboxdrv 2>/dev/null)") || {
+        log_error "Cannot find VirtualBox modules. Are they installed?"
+        exit 1
+    }
+
+    log_info "Signing modules in $modules_dir..."
+    
+    for module in "${modules[@]}"; do
+        if [ -f "$modules_dir/${module}.ko" ]; then
+            log_info "Signing $module..."
+            /usr/src/linux-headers-"$(uname -r)"/scripts/sign-file sha256 \
+                "$PRIVATE_KEY" "$PUBLIC_KEY" \
+                "$modules_dir/${module}.ko"
+        else
+            log_warn "Module $module not found, skipping..."
+        fi
+    done
+}
+
+# Load the signed modules
+load_modules() {
+    local modules=("vboxdrv" "vboxnetflt" "vboxnetadp" "vboxpci")
+    
+    log_info "Loading modules..."
+    for module in "${modules[@]}"; do
+        if modinfo "$module" >/dev/null 2>&1; then
+            modprobe "$module" && log_info "Loaded $module" || log_warn "Failed to load $module"
+        else
+            log_warn "Module $module not available, skipping..."
+        fi
+    done
+}
+
+# Rebuild VirtualBox modules if needed
+rebuild_modules() {
+    log_info "Rebuilding VirtualBox modules..."
+    /sbin/vboxconfig
+}
+
+# Verify the setup
+verify_setup() {
+    log_info "Verifying setup..."
+    echo "Module Status:"
+    lsmod | grep vbox
+    echo "VirtualBox Service Status:"
+    systemctl status vboxdrv --no-pager
+    echo "Kernel Messages:"
+    dmesg | grep -i vbox | tail -n 5
+}
+
+# Display usage information
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo "Options:"
+    echo "  --help          Show this help message"
+    echo "  --manual        Show manual commands reference"
+    echo "  --check-only    Only check current status"
+    echo "  --rebuild-only  Only rebuild modules"
+}
+
+# Show manual commands reference
+show_manual() {
+    grep '^#' "$0" | grep -A 100 "MANUAL COMMAND REFERENCE" | grep -B 100 "^################################" | grep -v "^####"
+}
+
+# Main execution
+main() {
+    case "${1:-}" in
+        --help)
+            show_usage
+            exit 0
+            ;;
+        --manual)
+            show_manual
+            exit 0
+            ;;
+        --check-only)
+            check_root
+            check_secure_boot
+            verify_setup
+            exit 0
+            ;;
+        --rebuild-only)
+            check_root
+            rebuild_modules
+            verify_setup
+            exit 0
+            ;;
+    esac
+
+    echo "VirtualBox Module Signing Script"
+    echo "--------------------------------"
+    
+    check_root
+    check_dependencies
+    install_prerequisites
+    check_secure_boot
+    generate_keys
+    enroll_key
+    sign_modules
+    rebuild_modules
+    load_modules
+    verify_setup
+    
+    log_info "Script completed successfully"
+    log_info "If this is your first time enrolling keys, please restart your computer"
+    log_info "and follow the MOK management prompts during boot"
+}
+
+# Run main function
+main "$@"
