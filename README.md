@@ -4,7 +4,7 @@
 
 ## 🚀 Overview
 
-VBXModProbe is a sophisticated Bash script designed to simplify and optimize VirtualBox installation and configuration on Linux systems. This comprehensive toolkit automates the complex process of setting up virtualization environments, handling dependencies, and ensuring optimal performance.
+Vbxmodprobe is a sophisticated Bash script designed to simplify and optimize VirtualBox installation and configuration on Linux systems. This comprehensive toolkit automates the complex process of setting up virtualization environments, handling dependencies, and ensuring optimal performance.
 
 ## ✨ Key Features
 
